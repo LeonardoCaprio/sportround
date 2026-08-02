@@ -1,0 +1,3 @@
+-- The application E2E suite creates isolated sessions through the public API.
+-- Keep the local database seed intentionally empty so `supabase db reset`
+-- produces a deterministic, privacy-safe environment.

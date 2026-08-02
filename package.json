@@ -1,0 +1,50 @@
+{
+  "name": "sportround",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test",
+    "test:schema": "node --import tsx scripts/verify-schema.ts",
+    "check": "npm run lint && npm run typecheck && npm run test && npm run test:schema && npm run build",
+    "supabase:start": "supabase start",
+    "supabase:stop": "supabase stop",
+    "supabase:reset": "supabase db reset --local",
+    "supabase:types": "supabase gen types --local --lang typescript --schema public"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.111.0",
+    "lucide-react": "1.28.0",
+    "next": "16.2.12",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.5.4",
+    "@playwright/test": "1.62.1",
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitest/coverage-v8": "4.1.10",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.12",
+    "supabase": "2.111.0",
+    "tailwindcss": "^4",
+    "tsx": "4.23.1",
+    "typescript": "^5",
+    "vitest": "4.1.10"
+  },
+  "overrides": {
+    "postcss": "8.5.25",
+    "sharp": "0.35.3"
+  }
+}
