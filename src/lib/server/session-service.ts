@@ -5,6 +5,7 @@ import { generateLineup } from "@/lib/domain/scheduler";
 import { toSnapshot } from "@/lib/domain/snapshot";
 import type { CreateSessionInput, SessionAggregate, SessionSnapshot } from "@/lib/domain/types";
 import { ApiError } from "./api";
+import { broadcastSessionUpdate } from "./realtime";
 import { createHostToken, createShareCode, hashHostToken, tokenMatches } from "./security";
 import { getStore } from "./store-factory";
 
@@ -19,6 +20,15 @@ const VIEWER_PERMISSIONS: SessionSnapshot["permissions"] = {
   canManageSession: false,
   canSubmitScore: true,
 };
+
+async function toUpdatedSnapshot(
+  aggregate: SessionAggregate,
+  permissions: SessionSnapshot["permissions"],
+): Promise<SessionSnapshot> {
+  const snapshot = toSnapshot(aggregate, permissions);
+  await broadcastSessionUpdate(snapshot.session.shareCode);
+  return snapshot;
+}
 
 async function requireHost(sessionId: string, hostToken: string | undefined): Promise<SessionAggregate> {
   const store = await getStore();
@@ -79,7 +89,7 @@ export async function generateNextRound(sessionId: string, hostToken?: string): 
     aggregate.session.id,
   );
   const updated = await (await getStore()).createRound(sessionId, lineup);
-  return toSnapshot(updated, HOST_PERMISSIONS);
+  return toUpdatedSnapshot(updated, HOST_PERMISSIONS);
 }
 
 export async function startPlannedRound(sessionId: string, hostToken?: string): Promise<SessionSnapshot> {
@@ -91,7 +101,7 @@ export async function startPlannedRound(sessionId: string, hostToken?: string): 
     throw new ApiError(409, "Complete the live round before starting another one.");
   }
   const updated = await (await getStore()).startRound(sessionId, planned.id);
-  return toSnapshot(updated, HOST_PERMISSIONS);
+  return toUpdatedSnapshot(updated, HOST_PERMISSIONS);
 }
 
 export async function saveHostScore(
@@ -106,7 +116,7 @@ export async function saveHostScore(
   if (!match) throw new ApiError(404, "Match not found.");
   if (match.status === "planned") throw new ApiError(409, "Start the round before saving a score.");
   const updated = await (await getStore()).saveScore(sessionId, matchId, score);
-  return toSnapshot(updated, HOST_PERMISSIONS);
+  return toUpdatedSnapshot(updated, HOST_PERMISSIONS);
 }
 
 export async function saveSharedScore(
@@ -120,7 +130,7 @@ export async function saveSharedScore(
   if (!match) throw new ApiError(404, "Match not found.");
   if (match.status !== "live") throw new ApiError(409, "Only a live match can be scored by viewers.");
   const updated = await (await getStore()).saveScore(aggregate.session.id, matchId, score);
-  return toSnapshot(updated, VIEWER_PERMISSIONS);
+  return toUpdatedSnapshot(updated, VIEWER_PERMISSIONS);
 }
 
 export async function replaceLineupPlayer(
@@ -139,7 +149,7 @@ export async function replaceLineupPlayer(
     assignmentId,
     replacementPlayerId,
   );
-  return toSnapshot(updated, HOST_PERMISSIONS);
+  return toUpdatedSnapshot(updated, HOST_PERMISSIONS);
 }
 
 export async function substitutePlayer(
@@ -160,7 +170,7 @@ export async function substitutePlayer(
     outgoingAssignmentId,
     replacementPlayerId,
   );
-  return toSnapshot(updated, HOST_PERMISSIONS);
+  return toUpdatedSnapshot(updated, HOST_PERMISSIONS);
 }
 
 export async function endHostSession(sessionId: string, hostToken?: string): Promise<SessionSnapshot> {
@@ -169,5 +179,5 @@ export async function endHostSession(sessionId: string, hostToken?: string): Pro
     throw new ApiError(409, "Complete every live court before ending the session.");
   }
   const updated = await (await getStore()).endSession(sessionId);
-  return toSnapshot(updated, HOST_PERMISSIONS);
+  return toUpdatedSnapshot(updated, HOST_PERMISSIONS);
 }

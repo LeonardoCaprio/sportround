@@ -21,7 +21,7 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import type {
   AssignmentRecord,
@@ -33,6 +33,12 @@ import type {
   Team,
 } from "@/lib/domain/types";
 import { LEVEL_LABELS } from "@/lib/domain/types";
+import {
+  SESSION_FALLBACK_POLL_MS,
+  SESSION_UPDATED_EVENT,
+  sessionRealtimeTopic,
+} from "@/lib/realtime";
+import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { Brand } from "./brand";
 
 type MainTab = "live" | "rounds" | "players" | "standings";
@@ -85,6 +91,7 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
   const [showLineup, setShowLineup] = useState(false);
   const [scoreMatchId, setScoreMatchId] = useState<string | null>(null);
   const [substituteMatchId, setSubstituteMatchId] = useState<string | null>(null);
+  const dialogOpenRef = useRef(false);
 
   const apiBase = mode === "host" ? `/api/sessions/${identifier}` : `/api/share/${identifier}`;
 
@@ -102,15 +109,48 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
   }, [apiBase]);
 
   useEffect(() => {
+    dialogOpenRef.current = Boolean(scoreMatchId || substituteMatchId);
+  }, [scoreMatchId, substituteMatchId]);
+
+  useEffect(() => {
     const initialLoad = window.setTimeout(() => void load(), 0);
-    const timer = window.setInterval(() => {
-      if (document.visibilityState === "visible" && !scoreMatchId && !substituteMatchId) void load(true);
-    }, 2500);
-    return () => {
-      window.clearTimeout(initialLoad);
-      window.clearInterval(timer);
+    return () => window.clearTimeout(initialLoad);
+  }, [load]);
+
+  useEffect(() => {
+    const refreshIfAvailable = () => {
+      if (document.visibilityState === "visible" && !dialogOpenRef.current) void load(true);
     };
-  }, [load, scoreMatchId, substituteMatchId]);
+    const timer = window.setInterval(refreshIfAvailable, SESSION_FALLBACK_POLL_MS);
+    document.addEventListener("visibilitychange", refreshIfAvailable);
+    window.addEventListener("online", refreshIfAvailable);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshIfAvailable);
+      window.removeEventListener("online", refreshIfAvailable);
+    };
+  }, [load]);
+
+  const shareCode = snapshot?.session.shareCode;
+
+  useEffect(() => {
+    if (!shareCode) return;
+    const supabase = getSupabaseBrowserClient();
+    if (!supabase) return;
+
+    const channel = supabase
+      .channel(sessionRealtimeTopic(shareCode), {
+        config: { private: false, broadcast: { self: false } },
+      })
+      .on("broadcast", { event: SESSION_UPDATED_EVENT }, () => {
+        if (document.visibilityState === "visible" && !dialogOpenRef.current) void load(true);
+      })
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [load, shareCode]);
 
   useEffect(() => {
     const restoreView = window.setTimeout(() => {

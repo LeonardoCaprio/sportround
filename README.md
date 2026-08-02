@@ -20,7 +20,7 @@ The MVP is deliberately runnable without a paid service. It starts with an in-me
 - Score is published only after **Save Score**
 - Winner badge on live and completed court cards
 - Direct **Start next game** or **Review lineup** flow
-- Shared viewer page with automatic 2.5-second refresh
+- Shared viewer page with Supabase Realtime updates and a 30-second fallback refresh
 - Round directory with Next and Completed history
 - Leaderboard with rank, games, W–L, points, win rate, and point difference
 - Host ownership through an HttpOnly token cookie
@@ -65,6 +65,9 @@ Copy the local API URL and service-role key into `.env.local`:
 DATA_BACKEND=supabase
 SUPABASE_URL=http://127.0.0.1:54321
 SUPABASE_SECRET_KEY=your-local-secret-or-service-role-key
+NEXT_PUBLIC_SUPABASE_REALTIME_ENABLED=true
+NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=your-local-publishable-or-anon-key
 NEXT_PUBLIC_APP_URL=http://127.0.0.1:3000
 ```
 
@@ -86,7 +89,7 @@ It creates normalized tables for sessions, players, rounds, matches, assignments
 - Explicit `service_role` access for the server-only data layer
 - Safe trigger search paths and revoked public function execution
 
-Browser clients never receive the service-role key. Public sharing goes through validated Next.js route handlers. The host token is generated with 32 random bytes, stored only as a SHA-256 hash in the database, and returned to the host as an HttpOnly, SameSite cookie.
+Browser clients never receive the service-role key. Realtime clients use only the browser-safe publishable key and receive an invalidation event without session data; the latest snapshot still comes through validated Next.js route handlers. The host token is generated with 32 random bytes, stored only as a SHA-256 hash in the database, and returned to the host as an HttpOnly, SameSite cookie.
 
 Anyone holding a share link can view the session and submit a score for a live match, as requested for this MVP. They cannot generate rounds, change lineups, substitute players, or end the session.
 
@@ -147,6 +150,6 @@ tests/e2e/               Desktop/mobile host and viewer flow
 
 - Badminton only; the domain types leave room for additional sports later.
 - Host access is device/browser-cookie based; account login and host transfer are not included.
-- Shared live refresh uses polling to stay simple and free; Supabase Realtime can be added later.
+- Shared live refresh uses Supabase Realtime Broadcast over WebSocket with focus/online refresh and a 30-second polling fallback.
 - The public score endpoint has schema and live-match validation but no distributed rate limiter yet.
 - No payment, booking, notification, or tournament-bracket feature is included.

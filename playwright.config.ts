@@ -24,6 +24,7 @@ export default defineConfig({
     env: {
       DATA_BACKEND: "memory",
       NEXT_PUBLIC_APP_URL: "http://127.0.0.1:3000",
+      NEXT_PUBLIC_SUPABASE_REALTIME_ENABLED: "false",
     },
   },
 });
