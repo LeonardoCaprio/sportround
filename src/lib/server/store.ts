@@ -12,6 +12,7 @@ export interface SportRoundStore {
   getSessionById(sessionId: string): Promise<SessionAggregate | null>;
   getSessionByShareCode(shareCode: string): Promise<SessionAggregate | null>;
   createRound(sessionId: string, plan: LineupPlan): Promise<SessionAggregate>;
+  deletePlannedRound(sessionId: string, roundId: string): Promise<SessionAggregate>;
   startRound(sessionId: string, roundId: string): Promise<SessionAggregate>;
   saveScore(
     sessionId: string,

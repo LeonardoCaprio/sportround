@@ -61,7 +61,10 @@ function collectHistory(rounds: RoundRecord[]) {
 
       for (const playerId of [...teams.a, ...teams.b]) {
         const current = stats.get(playerId) ?? { games: 0, lastRound: 0 };
-        if (match.status === "completed") current.games += 1;
+        // A live assignment is treated as a projected game so the next lineup
+        // can be prepared before the score is saved without over-scheduling
+        // somebody who is still on court.
+        current.games += 1;
         current.lastRound = Math.max(current.lastRound, round.roundNumber);
         stats.set(playerId, current);
       }

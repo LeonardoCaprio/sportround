@@ -2,6 +2,7 @@ import "server-only";
 
 import { assertValidFinalScore, type FinalScore } from "@/lib/domain/scoring";
 import { generateLineup } from "@/lib/domain/scheduler";
+import { evaluateSharedSessionAccess } from "@/lib/domain/shared-access";
 import { toSnapshot } from "@/lib/domain/snapshot";
 import type { CreateSessionInput, SessionAggregate, SessionSnapshot } from "@/lib/domain/types";
 import { ApiError } from "./api";
@@ -18,7 +19,7 @@ const HOST_PERMISSIONS: SessionSnapshot["permissions"] = {
 const VIEWER_PERMISSIONS: SessionSnapshot["permissions"] = {
   isHost: false,
   canManageSession: false,
-  canSubmitScore: true,
+  canSubmitScore: false,
 };
 
 async function toUpdatedSnapshot(
@@ -44,6 +45,18 @@ async function requireSharedSession(shareCode: string): Promise<SessionAggregate
   const store = await getStore();
   const aggregate = await store.getSessionByShareCode(shareCode);
   if (!aggregate) throw new ApiError(404, "Shared session not found.");
+
+  const access = evaluateSharedSessionAccess(aggregate.session);
+  if (!access.available) {
+    const message = access.reason === "ended"
+      ? "This session has ended."
+      : "This shared session has expired.";
+    throw new ApiError(410, message, {
+      reason: access.reason,
+      expiresAt: access.expiresAt,
+    });
+  }
+
   return aggregate;
 }
 
@@ -78,8 +91,8 @@ export async function getSharedSession(shareCode: string): Promise<SessionSnapsh
 export async function generateNextRound(sessionId: string, hostToken?: string): Promise<SessionSnapshot> {
   const aggregate = await requireHost(sessionId, hostToken);
   if (aggregate.session.status === "ended") throw new ApiError(409, "This session has ended.");
-  if (aggregate.rounds.some((round) => round.status !== "completed")) {
-    throw new ApiError(409, "Complete the current round before generating the next lineup.");
+  if (aggregate.rounds.some((round) => round.status === "planned")) {
+    throw new ApiError(409, "A next-round lineup has already been prepared.");
   }
   const lineup = generateLineup(
     aggregate.players,
@@ -89,6 +102,29 @@ export async function generateNextRound(sessionId: string, hostToken?: string): 
     aggregate.session.id,
   );
   const updated = await (await getStore()).createRound(sessionId, lineup);
+  return toUpdatedSnapshot(updated, HOST_PERMISSIONS);
+}
+
+export async function regeneratePlannedRound(
+  sessionId: string,
+  hostToken?: string,
+): Promise<SessionSnapshot> {
+  const aggregate = await requireHost(sessionId, hostToken);
+  if (aggregate.session.status === "ended") throw new ApiError(409, "This session has ended.");
+  const planned = aggregate.rounds.find((round) => round.status === "planned");
+  if (!planned) throw new ApiError(409, "There is no planned lineup to regenerate.");
+
+  const historyRounds = aggregate.rounds.filter((round) => round.id !== planned.id);
+  const lineup = generateLineup(
+    aggregate.players,
+    historyRounds,
+    aggregate.session.courtCount,
+    aggregate.session.gameFormat,
+    `${aggregate.session.id}:regenerate:${Date.now()}`,
+  );
+  const store = await getStore();
+  await store.deletePlannedRound(sessionId, planned.id);
+  const updated = await store.createRound(sessionId, lineup);
   return toUpdatedSnapshot(updated, HOST_PERMISSIONS);
 }
 
@@ -117,20 +153,6 @@ export async function saveHostScore(
   if (match.status === "planned") throw new ApiError(409, "Start the round before saving a score.");
   const updated = await (await getStore()).saveScore(sessionId, matchId, score);
   return toUpdatedSnapshot(updated, HOST_PERMISSIONS);
-}
-
-export async function saveSharedScore(
-  shareCode: string,
-  matchId: string,
-  score: FinalScore,
-): Promise<SessionSnapshot> {
-  assertValidFinalScore(score);
-  const aggregate = await requireSharedSession(shareCode);
-  const match = aggregate.rounds.flatMap((round) => round.matches).find((item) => item.id === matchId);
-  if (!match) throw new ApiError(404, "Match not found.");
-  if (match.status !== "live") throw new ApiError(409, "Only a live match can be scored by viewers.");
-  const updated = await (await getStore()).saveScore(aggregate.session.id, matchId, score);
-  return toUpdatedSnapshot(updated, VIEWER_PERMISSIONS);
 }
 
 export async function replaceLineupPlayer(

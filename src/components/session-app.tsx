@@ -4,6 +4,7 @@ import Link from "next/link";
 import {
   ArrowLeftRight,
   Calendar,
+  Camera,
   Check,
   Clock3,
   Edit3,
@@ -34,6 +35,11 @@ import type {
 } from "@/lib/domain/types";
 import { LEVEL_LABELS } from "@/lib/domain/types";
 import {
+  fairReplacementPool,
+  rankReplacementCandidates,
+  type ReplacementCandidate,
+} from "@/lib/domain/replacement";
+import {
   SESSION_FALLBACK_POLL_MS,
   SESSION_UPDATED_EVENT,
   sessionRealtimeTopic,
@@ -42,6 +48,22 @@ import { getSupabaseBrowserClient } from "@/lib/supabase/browser";
 import { Brand } from "./brand";
 
 type MainTab = "live" | "rounds" | "players" | "standings";
+type SharedUnavailableReason = "ended" | "expired";
+type ReplacementRequest = {
+  kind: "live" | "planned";
+  matchId: string;
+  outgoingAssignmentId?: number;
+};
+
+class SessionResponseError extends Error {
+  constructor(
+    message: string,
+    public readonly status: number,
+    public readonly reason?: SharedUnavailableReason,
+  ) {
+    super(message);
+  }
+}
 
 function activeTeam(match: MatchRecord, team: Team): AssignmentRecord[] {
   return match.assignments
@@ -74,9 +96,43 @@ function elapsed(start: string | null, end: string | null) {
   return `${minutes} min`;
 }
 
+function SharedUnavailableScreen({ reason }: { reason: SharedUnavailableReason }) {
+  const ended = reason === "ended";
+  return (
+    <div className="shared-unavailable-page">
+      <header className="shared-unavailable-header"><Brand /></header>
+      <main className="shared-unavailable-card">
+        <span className="shared-unavailable-icon" aria-hidden><ShieldCheck /></span>
+        <p className="eyebrow">VIEW-ONLY SESSION CLOSED</p>
+        <h1>{ended ? "This session has ended" : "This shared session has expired"}</h1>
+        <p>
+          {ended
+            ? "The host has closed this session. Live courts, lineups, scores, standings, and round history are no longer available from this shared link."
+            : "The scheduled play window has finished, so this shared link is no longer available. The host can still open the session and end it from the host workspace."}
+        </p>
+        <div className="shared-unavailable-note">
+          <strong>{ended ? "Thanks for playing." : "No session data is shown after expiry."}</strong>
+          <span>Only the host can reopen their private workspace.</span>
+        </div>
+        <Link className="button secondary" href="/">Back to SportRound</Link>
+      </main>
+    </div>
+  );
+}
+
 async function responsePayload(response: Response): Promise<SessionSnapshot> {
-  const payload = (await response.json()) as { data?: SessionSnapshot; error?: string };
-  if (!response.ok || !payload.data) throw new Error(payload.error ?? "The request could not be completed.");
+  const payload = (await response.json()) as {
+    data?: SessionSnapshot;
+    error?: string;
+    details?: { reason?: SharedUnavailableReason };
+  };
+  if (!response.ok || !payload.data) {
+    throw new SessionResponseError(
+      payload.error ?? "The request could not be completed.",
+      response.status,
+      payload.details?.reason,
+    );
+  }
   return payload.data;
 }
 
@@ -86,11 +142,13 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
   const [working, setWorking] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [sharedUnavailable, setSharedUnavailable] = useState<SharedUnavailableReason | null>(null);
   const [tab, setTab] = useState<MainTab>("live");
   const [roundsView, setRoundsView] = useState<"next" | "completed">("next");
   const [showLineup, setShowLineup] = useState(false);
+  const [captureStandings, setCaptureStandings] = useState(false);
   const [scoreMatchId, setScoreMatchId] = useState<string | null>(null);
-  const [substituteMatchId, setSubstituteMatchId] = useState<string | null>(null);
+  const [replacementRequest, setReplacementRequest] = useState<ReplacementRequest | null>(null);
   const dialogOpenRef = useRef(false);
 
   const apiBase = mode === "host" ? `/api/sessions/${identifier}` : `/api/share/${identifier}`;
@@ -100,17 +158,31 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
     try {
       const response = await fetch(apiBase, { cache: "no-store" });
       setSnapshot(await responsePayload(response));
+      setSharedUnavailable(null);
       setError(null);
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Could not load this session.");
+      if (
+        mode === "shared" &&
+        loadError instanceof SessionResponseError &&
+        loadError.status === 410 &&
+        loadError.reason
+      ) {
+        setSnapshot(null);
+        setScoreMatchId(null);
+        setReplacementRequest(null);
+        setSharedUnavailable(loadError.reason);
+        setError(null);
+      } else {
+        setError(loadError instanceof Error ? loadError.message : "Could not load this session.");
+      }
     } finally {
       if (!quiet) setLoading(false);
     }
-  }, [apiBase]);
+  }, [apiBase, mode]);
 
   useEffect(() => {
-    dialogOpenRef.current = Boolean(scoreMatchId || substituteMatchId);
-  }, [scoreMatchId, substituteMatchId]);
+    dialogOpenRef.current = Boolean(scoreMatchId || replacementRequest);
+  }, [replacementRequest, scoreMatchId]);
 
   useEffect(() => {
     const initialLoad = window.setTimeout(() => void load(), 0);
@@ -132,6 +204,35 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
   }, [load]);
 
   const shareCode = snapshot?.session.shareCode;
+  const sharedExpiresAt = mode === "shared" && snapshot
+    ? new Date(snapshot.session.scheduledStart).getTime() + snapshot.session.durationMinutes * 60_000
+    : null;
+
+  useEffect(() => {
+    if (sharedExpiresAt === null) return;
+
+    let timer: number | undefined;
+    let cancelled = false;
+    const scheduleExpiryRefresh = () => {
+      const remaining = sharedExpiresAt - Date.now();
+      if (remaining <= 0) {
+        void load(true);
+        return;
+      }
+      timer = window.setTimeout(
+        () => {
+          if (!cancelled) scheduleExpiryRefresh();
+        },
+        Math.min(remaining + 100, 2_147_000_000),
+      );
+    };
+
+    scheduleExpiryRefresh();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [load, sharedExpiresAt]);
 
   useEffect(() => {
     if (!shareCode) return;
@@ -164,6 +265,14 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
     return () => window.clearTimeout(restoreView);
   }, []);
 
+  const changeLineupReview = useCallback((visible: boolean) => {
+    setShowLineup(visible);
+    const url = new URL(window.location.href);
+    if (visible) url.searchParams.set("lineup", "1");
+    else url.searchParams.delete("lineup");
+    window.history.replaceState(window.history.state, "", url);
+  }, []);
+
   const perform = useCallback(async (key: string, path: string, body?: unknown) => {
     setWorking(key);
     setError(null);
@@ -189,6 +298,10 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
     return <div className="full-loader"><Brand /><LoaderCircle className="spin" aria-hidden /><span>Loading live session…</span></div>;
   }
 
+  if (mode === "shared" && sharedUnavailable) {
+    return <SharedUnavailableScreen reason={sharedUnavailable} />;
+  }
+
   if (!snapshot) {
     return <div className="error-page"><Brand /><h1>Session unavailable</h1><p>{error}</p><Link className="button secondary" href="/">Back home</Link></div>;
   }
@@ -200,16 +313,29 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
   const scoreMatch = scoreMatchId
     ? snapshot.rounds.flatMap((round) => round.matches).find((match) => match.id === scoreMatchId) ?? null
     : null;
-  const substituteMatch = substituteMatchId
-    ? snapshot.rounds.flatMap((round) => round.matches).find((match) => match.id === substituteMatchId) ?? null
+  const replacementMatch = replacementRequest
+    ? snapshot.rounds.flatMap((round) => round.matches).find((match) => match.id === replacementRequest.matchId) ?? null
     : null;
 
   async function generate(review: boolean) {
     if (mode !== "host") return null;
     const data = await perform("generate", `${apiBase}/rounds/generate`);
     if (data && review) {
-      setShowLineup(true);
+      changeLineupReview(true);
       setTab("live");
+    }
+    return data;
+  }
+
+  async function regenerate(review: boolean) {
+    if (mode !== "host") return null;
+    const data = await perform("regenerate", `${apiBase}/rounds/regenerate`);
+    if (data) {
+      setNotice("The next-round lineup has been regenerated.");
+      if (review) {
+        changeLineupReview(true);
+        setTab("live");
+      }
     }
     return data;
   }
@@ -218,7 +344,7 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
     if (mode !== "host") return;
     const data = await perform("start", `${apiBase}/rounds/start`);
     if (data) {
-      setShowLineup(false);
+      changeLineupReview(false);
       setNotice(`Round ${data.session.currentRoundNumber} is now live.`);
     }
   }
@@ -235,11 +361,10 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
   }
 
   async function saveScore(match: MatchRecord, winner: Team, loserScore: number) {
+    if (mode !== "host") return;
     const teamAScore = winner === "a" ? 21 : loserScore;
     const teamBScore = winner === "b" ? 21 : loserScore;
-    const path = mode === "host"
-      ? `${apiBase}/matches/${match.id}/score`
-      : `${apiBase}/matches/${match.id}/score`;
+    const path = `${apiBase}/matches/${match.id}/score`;
     const data = await perform(`score-${match.id}`, path, { winner, teamAScore, teamBScore });
     if (data) {
       setScoreMatchId(null);
@@ -250,7 +375,7 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
   async function copyShareLink() {
     const link = `${window.location.origin}/s/${session.shareCode}`;
     await navigator.clipboard.writeText(link);
-    setNotice("Viewer link copied. Anyone with the link can view and submit live scores.");
+    setNotice("View-only link copied. It closes when the session ends or its scheduled time expires.");
   }
 
   async function endSession() {
@@ -260,16 +385,16 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
   }
 
   return (
-    <div className="site-shell session-site">
+    <div className={`site-shell session-site ${captureStandings ? "capture-standings" : ""}`}>
       <header className="topbar session-topbar">
         <div className="container topbar-inner">
           <Brand />
           <div className="topbar-actions">
             <span className={`mode-badge ${mode === "shared" ? "viewer" : ""}`}>
               {mode === "host" ? <ShieldCheck size={14} aria-hidden /> : <Users size={14} aria-hidden />}
-              {mode === "host" ? "HOST MODE" : "SHARED VIEW"}
+              {mode === "host" ? "HOST MODE" : "VIEW ONLY"}
             </span>
-            <button className="button ghost compact share-label" onClick={copyShareLink}><Share2 size={16} aria-hidden /> Share</button>
+            {mode === "host" ? <button className="button ghost compact share-label" onClick={copyShareLink}><Share2 size={16} aria-hidden /> Share</button> : null}
           </div>
         </div>
       </header>
@@ -291,7 +416,7 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
 
         <nav className="session-tabs" aria-label="Session navigation">
           {(["live", "rounds", "players", "standings"] as MainTab[]).map((item) => (
-            <button className={tab === item ? "active" : ""} key={item} onClick={() => setTab(item)}>{item === "live" ? "Live" : item[0].toUpperCase() + item.slice(1)}</button>
+            <button className={tab === item ? "active" : ""} key={item} onClick={() => { setTab(item); if (item !== "standings") setCaptureStandings(false); }}>{item === "live" ? "Live" : item[0].toUpperCase() + item.slice(1)}</button>
           ))}
         </nav>
 
@@ -305,13 +430,14 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
             latestCompletedRound={completedRounds[0] ?? null}
             plannedRound={plannedRound}
             showLineup={showLineup}
-            setShowLineup={setShowLineup}
+            setShowLineup={changeLineupReview}
             onScore={setScoreMatchId}
-            onSubstitute={setSubstituteMatchId}
+            onSubstitute={(matchId) => setReplacementRequest({ kind: "live", matchId })}
             onGenerate={() => void generate(true)}
+            onRegenerate={() => void regenerate(true)}
             onStart={() => void startRound()}
             onStartDirect={() => void startNextDirect()}
-            onReplace={(assignmentId, playerId) => perform("replace", `${apiBase}/lineup/swap`, { assignmentId, replacementPlayerId: playerId })}
+            onRequestReplace={(matchId, outgoingAssignmentId) => setReplacementRequest({ kind: "planned", matchId, outgoingAssignmentId })}
             working={working}
           />
         ) : null}
@@ -326,17 +452,18 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
             onScore={setScoreMatchId}
             onStart={() => void startRound()}
             onGenerate={() => void generate(true)}
-            onReplace={(assignmentId, playerId) => perform("replace", `${apiBase}/lineup/swap`, { assignmentId, replacementPlayerId: playerId })}
+            onRegenerate={() => void regenerate(true)}
+            onRequestReplace={(matchId, outgoingAssignmentId) => setReplacementRequest({ kind: "planned", matchId, outgoingAssignmentId })}
             working={working}
           />
         ) : null}
         {tab === "players" ? <PlayersPanel snapshot={snapshot} /> : null}
-        {tab === "standings" ? <StandingsPanel standings={snapshot.standings} /> : null}
+        {tab === "standings" ? <StandingsPanel snapshot={snapshot} captureMode={captureStandings} onCaptureModeChange={setCaptureStandings} /> : null}
       </main>
 
-      <footer className="site-footer"><div className="container footer-inner"><Brand compact /><span>Updates refresh automatically for everyone with the session link.</span></div></footer>
+      <footer className="site-footer"><div className="container footer-inner"><Brand compact /><span>{mode === "host" ? "Host changes refresh automatically for everyone with the view-only link." : "This view-only session refreshes automatically."}</span></div></footer>
 
-      {scoreMatch ? (
+      {mode === "host" && scoreMatch ? (
         <ScoreDialog
           match={scoreMatch}
           players={snapshot.players}
@@ -346,17 +473,21 @@ export function SessionApp({ identifier, mode }: { identifier: string; mode: "ho
           onSave={(winner, loserScore) => void saveScore(scoreMatch, winner, loserScore)}
         />
       ) : null}
-      {substituteMatch ? (
-        <SubstitutionDialog
-          match={substituteMatch}
+      {mode === "host" && replacementRequest && replacementMatch ? (
+        <ReplacementDialog
+          match={replacementMatch}
           snapshot={snapshot}
-          saving={working === "substitute"}
-          onClose={() => setSubstituteMatchId(null)}
+          kind={replacementRequest.kind}
+          initialOutgoingAssignmentId={replacementRequest.outgoingAssignmentId}
+          saving={working === "substitute" || working === "replace"}
+          onClose={() => setReplacementRequest(null)}
           onSave={async (outgoingAssignmentId, replacementPlayerId) => {
-            const data = await perform("substitute", `${apiBase}/matches/${substituteMatch.id}/substitute`, { outgoingAssignmentId, replacementPlayerId });
+            const data = replacementRequest.kind === "live"
+              ? await perform("substitute", `${apiBase}/matches/${replacementMatch.id}/substitute`, { outgoingAssignmentId, replacementPlayerId })
+              : await perform("replace", `${apiBase}/lineup/swap`, { assignmentId: outgoingAssignmentId, replacementPlayerId });
             if (data) {
-              setSubstituteMatchId(null);
-              setNotice("Player substitution recorded for this live match.");
+              setReplacementRequest(null);
+              setNotice(replacementRequest.kind === "live" ? "Player substitution recorded for this live match." : "The planned lineup has been updated.");
             }
           }}
         />
@@ -375,9 +506,10 @@ function LivePanel({
   onScore,
   onSubstitute,
   onGenerate,
+  onRegenerate,
   onStart,
   onStartDirect,
-  onReplace,
+  onRequestReplace,
   working,
 }: {
   snapshot: SessionSnapshot;
@@ -389,20 +521,31 @@ function LivePanel({
   onScore: (id: string) => void;
   onSubstitute: (id: string) => void;
   onGenerate: () => void;
+  onRegenerate: () => void;
   onStart: () => void;
   onStartDirect: () => void;
-  onReplace: (assignmentId: number, playerId: string) => Promise<SessionSnapshot | null>;
+  onRequestReplace: (matchId: string, assignmentId: number) => void;
   working: string | null;
 }) {
   const canManage = snapshot.permissions.canManageSession;
   const visibleRound = liveRound ?? latestCompletedRound;
+  const activeCourtCount = liveRound?.matches.filter((match) => match.status === "live").length ?? 0;
+  const lineupNeedsReview = Boolean(
+    plannedRound &&
+      liveRound?.matches.some((match) =>
+        match.substitutions.some(
+          (substitution) => new Date(substitution.createdAt).getTime() > new Date(plannedRound.createdAt).getTime(),
+        ),
+      ),
+  );
 
   if (showLineup && plannedRound) {
     return (
       <section className="tab-panel">
         <div className="panel-heading"><div><p className="eyebrow">Review before play</p><h2>Round {plannedRound.roundNumber} lineup</h2><p>Games played are shown beside every player. Replace anyone with a waiting player before starting.</p></div><button className="button ghost compact" onClick={() => setShowLineup(false)}><X size={16} /> Close review</button></div>
-        <LineupReview snapshot={snapshot} round={plannedRound} onReplace={onReplace} working={working} />
-        {canManage ? <div className="sticky-action"><div><strong>Lineup reviewed?</strong><span>Starting locks all courts in this round.</span></div><button className="button primary" onClick={onStart} disabled={working !== null}><Play size={17} /> Start Round {plannedRound.roundNumber}</button></div> : null}
+        {lineupNeedsReview ? <div className="lineup-warning" role="status"><div><strong>Lineup needs review</strong><span>A live player replacement happened after this lineup was prepared. Review it or regenerate a fresh rotation.</span></div>{canManage ? <button className="button secondary compact" onClick={onRegenerate} disabled={working !== null}><RefreshCw size={15} /> Regenerate</button> : null}</div> : null}
+        <LineupReview snapshot={snapshot} round={plannedRound} onRequestReplace={onRequestReplace} working={working} />
+        {canManage ? <div className="sticky-action"><div><strong>{liveRound ? `Waiting for ${activeCourtCount} active court${activeCourtCount === 1 ? "" : "s"}` : "Lineup reviewed?"}</strong><span>{liveRound ? "You can keep editing this lineup while the current round finishes." : "Starting locks all courts in this round."}</span></div><div className="sticky-action-buttons"><button className="button secondary" onClick={onRegenerate} disabled={working !== null}><RefreshCw size={16} /> Regenerate</button><button className="button primary" onClick={onStart} disabled={Boolean(liveRound) || working !== null}><Play size={17} /> {liveRound ? "Waiting for current round" : `Start Round ${plannedRound.roundNumber}`}</button></div></div> : null}
       </section>
     );
   }
@@ -416,11 +559,11 @@ function LivePanel({
         )}
       </div>
       <aside className="next-panel">
-        <div className="next-panel-head"><div><p className="eyebrow">Up next</p><h2>{plannedRound ? `Round ${plannedRound.roundNumber}` : "Next round"}</h2></div><span className={`state-chip ${plannedRound ? "ready" : "pending"}`}>{plannedRound ? "READY" : liveRound ? "WAITING" : "AVAILABLE"}</span></div>
-        {plannedRound ? <MiniLineup round={plannedRound} players={snapshot.players} /> : liveRound ? <p className="next-message">Finish every live court before the next lineup can be generated.</p> : snapshot.session.status !== "ended" ? <p className="next-message">SportRound will prioritize rested players and keep total games balanced.</p> : <p className="next-message">This session has ended.</p>}
+        <div className="next-panel-head"><div><p className="eyebrow">Up next</p><h2>{plannedRound ? `Round ${plannedRound.roundNumber}` : "Next round"}</h2></div><span className={`state-chip ${plannedRound ? "ready" : "pending"}`}>{plannedRound ? liveRound ? "PREPARED" : "READY" : "AVAILABLE"}</span></div>
+        {plannedRound ? <><MiniLineup round={plannedRound} players={snapshot.players} />{liveRound ? <p className="next-ready-note">Lineup prepared · start unlocks after {activeCourtCount} active court{activeCourtCount === 1 ? "" : "s"} finish.</p> : null}</> : liveRound ? <p className="next-message">Prepare the next lineup now so waiting players can get ready. Current players count as a projected game.</p> : snapshot.session.status !== "ended" ? <p className="next-message">SportRound will prioritize rested players and keep total games balanced.</p> : <p className="next-message">This session has ended.</p>}
         {canManage && snapshot.session.status !== "ended" ? <div className="next-actions">
-          {plannedRound ? <button className="button secondary" onClick={() => setShowLineup(true)}>Review lineup</button> : <button className="button secondary" onClick={onGenerate} disabled={Boolean(liveRound) || working !== null}><RefreshCw size={16} /> Review next lineup</button>}
-          <button className="button primary" onClick={plannedRound ? onStart : onStartDirect} disabled={Boolean(liveRound) || working !== null}><Play size={16} /> Start next game</button>
+          {plannedRound ? <><button className="button secondary" onClick={() => setShowLineup(true)}>Review lineup</button><button className="button ghost" onClick={onRegenerate} disabled={working !== null}><RefreshCw size={16} /> Regenerate</button></> : <button className="button secondary" onClick={onGenerate} disabled={working !== null}><RefreshCw size={16} /> {liveRound ? "Prepare next lineup" : "Review next lineup"}</button>}
+          <button className="button primary" onClick={plannedRound ? onStart : onStartDirect} disabled={Boolean(liveRound) || working !== null}><Play size={16} /> {liveRound ? "Waiting for current round" : "Start next game"}</button>
         </div> : null}
       </aside>
     </section>
@@ -436,13 +579,17 @@ function CourtCard({ match, snapshot, onScore, onSubstitute }: { match: MatchRec
   return (
     <article className={`court-card ${match.status}`} data-testid={`court-${match.courtNumber}`}>
       <header className="court-card-head"><div><span>COURT {match.courtNumber}</span>{match.status === "live" ? <span className="live-label"><i /> LIVE</span> : null}</div><span>{match.status === "completed" ? `FINISHED · ${elapsed(match.startedAt, match.completedAt)}` : elapsed(match.startedAt, null)}</span></header>
-      <div className="court-surface">
-        <span className="court-net" aria-hidden /><span className="service-line service-one" aria-hidden /><span className="service-line service-two" aria-hidden />
-        <TeamHalf team="a" assignments={teamA} score={match.teamAScore} winner={match.winner} playerMap={playerMap} standingMap={standingMap} />
-        <TeamHalf team="b" assignments={teamB} score={match.teamBScore} winner={match.winner} playerMap={playerMap} standingMap={standingMap} />
+      <div className={`court-surface ${snapshot.session.gameFormat}`}>
+        <span className="court-back-strip team-a" aria-hidden />
+        <CourtPlayerZone team="a" assignments={teamA} winner={match.winner} playerMap={playerMap} standingMap={standingMap} />
+        <CourtScoreCell team="a" score={match.teamAScore} winner={match.winner} />
+        <span className="court-net" aria-hidden />
+        <CourtScoreCell team="b" score={match.teamBScore} winner={match.winner} />
+        <CourtPlayerZone team="b" assignments={teamB} winner={match.winner} playerMap={playerMap} standingMap={standingMap} />
+        <span className="court-back-strip team-b" aria-hidden />
       </div>
       <footer className="court-card-foot">
-        <span>{match.substitutions.length ? `${match.substitutions.length} player substitution recorded` : match.status === "completed" ? "Final score saved" : "Score is shared after Save Score"}</span>
+        <span>{match.substitutions.length ? `${match.substitutions.length} player substitution recorded` : match.status === "completed" ? "Final score saved" : snapshot.permissions.isHost ? "Score is shared after Save Score" : "View only · score updates are host controlled"}</span>
         <div>
           {match.status === "live" && snapshot.permissions.canManageSession ? <button className="button ghost compact" onClick={() => onSubstitute(match.id)}><UserRoundCog size={16} /> Replace player</button> : null}
           {(match.status === "live" || (match.status === "completed" && snapshot.permissions.isHost)) && snapshot.permissions.canSubmitScore ? <button className="button primary compact" onClick={() => onScore(match.id)}><Edit3 size={16} /> {match.status === "completed" ? "Correct result" : "Update score"}</button> : null}
@@ -452,17 +599,22 @@ function CourtCard({ match, snapshot, onScore, onSubstitute }: { match: MatchRec
   );
 }
 
-function TeamHalf({ team, assignments, score, winner, playerMap, standingMap }: { team: Team; assignments: AssignmentRecord[]; score: number; winner: Team | null; playerMap: Map<string, PlayerRecord>; standingMap: Map<string, PlayerStanding> }) {
+function CourtPlayerZone({ team, assignments, winner, playerMap, standingMap }: { team: Team; assignments: AssignmentRecord[]; winner: Team | null; playerMap: Map<string, PlayerRecord>; standingMap: Map<string, PlayerStanding> }) {
   const isWinner = winner === team;
   return (
-    <div className={`court-half ${isWinner ? "winner" : winner ? "loser" : ""}`}>
-      <div className="court-team-copy">
-        {isWinner ? <span className="winner-badge"><Trophy size={12} /> WINNER</span> : null}
-        <div className="team-players">{assignments.map((assignment) => { const player = playerMap.get(assignment.playerId); const standing = standingMap.get(assignment.playerId); return player ? <div key={assignment.id}><strong>{player.name}</strong><span>{LEVEL_LABELS[player.level]} · {standing?.gamesPlayed ?? 0} played</span></div> : null; })}</div>
-      </div>
-      <strong className="court-score">{String(score).padStart(2, "0")}</strong>
+    <div className={`court-player-zone team-${team} ${assignments.length > 1 ? "doubles" : "singles"} ${isWinner ? "winner" : winner ? "loser" : ""}`}>
+      {assignments.map((assignment) => {
+        const player = playerMap.get(assignment.playerId);
+        const standing = standingMap.get(assignment.playerId);
+        return player ? <div className="court-player" key={assignment.id}><strong>{player.name}</strong><span>{LEVEL_LABELS[player.level]} · {standing?.gamesPlayed ?? 0} played</span></div> : null;
+      })}
     </div>
   );
+}
+
+function CourtScoreCell({ team, score, winner }: { team: Team; score: number; winner: Team | null }) {
+  const isWinner = winner === team;
+  return <div className={`court-score-cell team-${team} ${isWinner ? "winner" : winner ? "loser" : ""}`}>{isWinner ? <span className="winner-badge"><Trophy size={12} /> WINNER</span> : null}<strong className="court-score">{String(score).padStart(2, "0")}</strong></div>;
 }
 
 function MiniLineup({ round, players }: { round: RoundRecord; players: PlayerRecord[] }) {
@@ -470,26 +622,124 @@ function MiniLineup({ round, players }: { round: RoundRecord; players: PlayerRec
   return <div className="mini-lineup">{round.matches.map((match) => <div key={match.id}><span>COURT {match.courtNumber}</span><strong>{activeTeam(match, "a").map((item) => map.get(item.playerId)).join(" + ")}</strong><em>vs</em><strong>{activeTeam(match, "b").map((item) => map.get(item.playerId)).join(" + ")}</strong></div>)}</div>;
 }
 
-function LineupReview({ snapshot, round, onReplace, working }: { snapshot: SessionSnapshot; round: RoundRecord; onReplace: (assignmentId: number, playerId: string) => Promise<SessionSnapshot | null>; working: string | null }) {
-  const [choices, setChoices] = useState<Record<number, string>>({});
+function LineupReview({ snapshot, round, onRequestReplace, working }: { snapshot: SessionSnapshot; round: RoundRecord; onRequestReplace: (matchId: string, assignmentId: number) => void; working: string | null }) {
   const playerMap = new Map(snapshot.players.map((player) => [player.id, player]));
   const standingMap = new Map(snapshot.standings.map((standing) => [standing.playerId, standing]));
   const assignedIds = new Set(round.matches.flatMap((match) => match.assignments.filter((item) => item.active).map((item) => item.playerId)));
   const waiting = snapshot.players.filter((player) => player.active && !assignedIds.has(player.id));
 
-  return <div className="lineup-review"><div className="lineup-courts">{round.matches.map((match) => <article className="lineup-court" key={match.id}><header><span>COURT {match.courtNumber}</span><span>BALANCED PAIRING</span></header>{(["a", "b"] as Team[]).map((team) => <div className="lineup-team" key={team}><span>TEAM {team.toUpperCase()}</span>{activeTeam(match, team).map((assignment) => { const player = playerMap.get(assignment.playerId); const standing = standingMap.get(assignment.playerId); return player ? <div className="lineup-player" key={assignment.id}><div><strong>{player.name}</strong><span>{LEVEL_LABELS[player.level]} · {standing?.gamesPlayed ?? 0} played</span></div>{snapshot.permissions.canManageSession && waiting.length ? <div className="replace-control"><select aria-label={`Replacement for ${player.name}`} value={choices[assignment.id] ?? ""} onChange={(event) => setChoices((current) => ({ ...current, [assignment.id]: event.target.value }))}><option value="">Replace…</option>{waiting.map((candidate) => <option value={candidate.id} key={candidate.id}>{candidate.name} · {standingMap.get(candidate.id)?.gamesPlayed ?? 0} played</option>)}</select><button className="icon-button" disabled={!choices[assignment.id] || working !== null} onClick={() => void onReplace(assignment.id, choices[assignment.id])} aria-label={`Confirm replacement for ${player.name}`}><ArrowLeftRight size={15} /></button></div> : null}</div> : null; })}</div>)}</article>)}</div><aside className="waiting-list"><p className="eyebrow">Waiting this round</p><h3>{waiting.length} players resting</h3>{waiting.map((player) => <div key={player.id}><span><strong>{player.name}</strong><small>{LEVEL_LABELS[player.level]}</small></span><b>{standingMap.get(player.id)?.gamesPlayed ?? 0} played</b></div>)}</aside></div>;
+  return <div className="lineup-review"><div className="lineup-courts">{round.matches.map((match) => <article className="lineup-court" key={match.id}><header><span>COURT {match.courtNumber}</span><span>BALANCED PAIRING</span></header>{(["a", "b"] as Team[]).map((team) => <div className="lineup-team" key={team}><span>TEAM {team.toUpperCase()}</span>{activeTeam(match, team).map((assignment) => { const player = playerMap.get(assignment.playerId); const standing = standingMap.get(assignment.playerId); return player ? <div className="lineup-player" key={assignment.id}><div><strong>{player.name}</strong><span>{LEVEL_LABELS[player.level]} · {standing?.gamesPlayed ?? 0} played</span></div>{snapshot.permissions.canManageSession && waiting.length ? <button className="button ghost compact replace-control" disabled={working !== null} onClick={() => onRequestReplace(match.id, assignment.id)}><ArrowLeftRight size={15} /> Replace</button> : null}</div> : null; })}</div>)}</article>)}</div><aside className="waiting-list"><p className="eyebrow">Waiting this round</p><h3>{waiting.length} players resting</h3>{waiting.map((player) => <div key={player.id}><span><strong>{player.name}</strong><small>{LEVEL_LABELS[player.level]}</small></span><b>{standingMap.get(player.id)?.gamesPlayed ?? 0} played</b></div>)}</aside></div>;
 }
 
-function RoundsPanel({ snapshot, plannedRound, completedRounds, view, setView, onScore, onStart, onGenerate, onReplace, working }: { snapshot: SessionSnapshot; plannedRound: RoundRecord | null; completedRounds: RoundRecord[]; view: "next" | "completed"; setView: (view: "next" | "completed") => void; onScore: (id: string) => void; onStart: () => void; onGenerate: () => void; onReplace: (assignmentId: number, playerId: string) => Promise<SessionSnapshot | null>; working: string | null }) {
-  return <section className="tab-panel"><div className="panel-heading"><div><p className="eyebrow">Round directory</p><h2>Next and completed</h2><p>Review upcoming lineups or audit every saved court result.</p></div></div><div className="subtabs"><button className={view === "next" ? "active" : ""} onClick={() => setView("next")}>Next</button><button className={view === "completed" ? "active" : ""} onClick={() => setView("completed")}>Completed <span>{completedRounds.length}</span></button></div>{view === "next" ? plannedRound ? <><LineupReview snapshot={snapshot} round={plannedRound} onReplace={onReplace} working={working} />{snapshot.permissions.canManageSession ? <div className="sticky-action"><div><strong>Round {plannedRound.roundNumber} is ready</strong><span>All courts start together.</span></div><button className="button primary" onClick={onStart} disabled={working !== null}><Play size={17} /> Start next game</button></div> : null}</> : <div className="empty-panel"><RefreshCw /><h3>No generated lineup</h3><p>Generate the next round after all current courts finish.</p>{snapshot.permissions.canManageSession && snapshot.session.status !== "ended" ? <button className="button primary" onClick={onGenerate} disabled={working !== null}>Generate next lineup</button> : null}</div> : <div className="history-list">{completedRounds.length ? completedRounds.map((round) => <section className="history-round" key={round.id}><header><div><p className="eyebrow">COMPLETED</p><h3>Round {round.roundNumber}</h3></div><span>{round.completedAt ? formatDateTime(round.completedAt, snapshot.session.timezone) : "Completed"}</span></header><div className="court-list">{round.matches.map((match) => <CourtCard key={match.id} match={match} snapshot={snapshot} onScore={onScore} onSubstitute={() => undefined} />)}</div></section>) : <div className="empty-panel"><Trophy /><h3>No completed rounds yet</h3><p>Saved final scores will appear here for everyone.</p></div>}</div>}</section>;
+function RoundsPanel({
+  snapshot,
+  plannedRound,
+  completedRounds,
+  view,
+  setView,
+  onScore,
+  onStart,
+  onGenerate,
+  onRegenerate,
+  onRequestReplace,
+  working,
+}: {
+  snapshot: SessionSnapshot;
+  plannedRound: RoundRecord | null;
+  completedRounds: RoundRecord[];
+  view: "next" | "completed";
+  setView: (view: "next" | "completed") => void;
+  onScore: (id: string) => void;
+  onStart: () => void;
+  onGenerate: () => void;
+  onRegenerate: () => void;
+  onRequestReplace: (matchId: string, assignmentId: number) => void;
+  working: string | null;
+}) {
+  const liveRound = snapshot.rounds.find((round) => round.status === "live") ?? null;
+  const activeCourts = liveRound?.matches.filter((match) => match.status === "live").length ?? 0;
+
+  return (
+    <section className="tab-panel">
+      <div className="panel-heading">
+        <div><p className="eyebrow">Round directory</p><h2>Next and completed</h2><p>Prepare the next rotation while current courts play, or audit every saved result.</p></div>
+      </div>
+      <div className="subtabs">
+        <button className={view === "next" ? "active" : ""} onClick={() => setView("next")}>Next</button>
+        <button className={view === "completed" ? "active" : ""} onClick={() => setView("completed")}>Completed <span>{completedRounds.length}</span></button>
+      </div>
+      {view === "next" ? plannedRound ? (
+        <>
+          {liveRound ? <div className="lineup-warning"><div><strong>Prepared while Round {liveRound.roundNumber} is live</strong><span>Review or regenerate now. Starting unlocks after {activeCourts} active court{activeCourts === 1 ? "" : "s"} finish.</span></div></div> : null}
+          <LineupReview snapshot={snapshot} round={plannedRound} onRequestReplace={onRequestReplace} working={working} />
+          {snapshot.permissions.canManageSession ? (
+            <div className="sticky-action">
+              <div><strong>Round {plannedRound.roundNumber} is {liveRound ? "prepared" : "ready"}</strong><span>{liveRound ? "Current players already count toward rotation fairness." : "All courts start together."}</span></div>
+              <div className="sticky-action-buttons">
+                <button className="button secondary" onClick={onRegenerate} disabled={working !== null}><RefreshCw size={16} /> Regenerate</button>
+                <button className="button primary" onClick={onStart} disabled={Boolean(liveRound) || working !== null}><Play size={17} /> {liveRound ? "Waiting for current round" : "Start next game"}</button>
+              </div>
+            </div>
+          ) : null}
+        </>
+      ) : (
+        <div className="empty-panel">
+          <RefreshCw />
+          <h3>No prepared lineup</h3>
+          <p>{liveRound ? "Generate it now so the next players have time to get ready." : "SportRound will balance games played, rest, and player level."}</p>
+          {snapshot.permissions.canManageSession && snapshot.session.status !== "ended" ? <button className="button primary" onClick={onGenerate} disabled={working !== null}>{liveRound ? "Prepare next lineup" : "Generate next lineup"}</button> : null}
+        </div>
+      ) : (
+        <div className="history-list">
+          {completedRounds.length ? completedRounds.map((round) => (
+            <section className="history-round" key={round.id}>
+              <header><div><p className="eyebrow">COMPLETED</p><h3>Round {round.roundNumber}</h3></div><span>{round.completedAt ? formatDateTime(round.completedAt, snapshot.session.timezone) : "Completed"}</span></header>
+              <div className="court-list">{round.matches.map((match) => <CourtCard key={match.id} match={match} snapshot={snapshot} onScore={onScore} onSubstitute={() => undefined} />)}</div>
+            </section>
+          )) : <div className="empty-panel"><Trophy /><h3>No completed rounds yet</h3><p>Saved final scores will appear here while the shared session remains active.</p></div>}
+        </div>
+      )}
+    </section>
+  );
 }
 
 function PlayersPanel({ snapshot }: { snapshot: SessionSnapshot }) {
   return <section className="tab-panel"><div className="panel-heading"><div><p className="eyebrow">Rotation visibility</p><h2>Players</h2><p>Everyone can see who is playing, waiting, and how many games each person has played.</p></div><span className="count-badge">{snapshot.players.length} ACTIVE</span></div><div className="player-table"><div className="table-head"><span>Player</span><span>Level</span><span>Played</span><span>Status</span></div>{snapshot.standings.map((standing) => <div className="table-row" key={standing.playerId}><strong>{standing.name}</strong><span><i className={`level-dot ${standing.level}`} /> {LEVEL_LABELS[standing.level]}</span><b>{standing.gamesPlayed}</b><span className={`player-status ${standing.status}`}>{standing.status === "playing" ? `Playing · Court ${standing.currentCourt}` : standing.status === "up-next" ? `Up next · Court ${standing.nextCourt}` : standing.status === "inactive" ? "Inactive" : "Waiting"}</span></div>)}</div></section>;
 }
 
-function StandingsPanel({ standings }: { standings: PlayerStanding[] }) {
-  return <section className="tab-panel"><div className="panel-heading"><div><p className="eyebrow">Leaderboard</p><h2>Standings</h2><p>A win earns 3 points. Ties are ordered by point difference, then total wins.</p></div><span className="rules-note"><Trophy size={15} /> WIN = 3 PTS</span></div><div className="standings-table"><div className="standings-head"><span>Rank</span><span>Player</span><span>Games</span><span>W–L</span><span>Points</span><span>Win rate</span><span>+/−</span></div>{standings.map((standing, index) => <div className={`standings-row ${index < 3 ? "podium" : ""}`} key={standing.playerId}><b className="rank">{index + 1}</b><span><strong>{standing.name}</strong><small>{LEVEL_LABELS[standing.level]}</small></span><span>{standing.gamesPlayed}</span><span>{standing.wins}–{standing.losses}</span><b className="leader-points">{standing.leaderboardPoints}</b><span>{standing.winRate}%</span><span className={standing.pointDifference > 0 ? "positive" : standing.pointDifference < 0 ? "negative" : ""}>{standing.pointDifference > 0 ? "+" : ""}{standing.pointDifference}</span></div>)}</div></section>;
+function StandingsPanel({ snapshot, captureMode, onCaptureModeChange }: { snapshot: SessionSnapshot; captureMode: boolean; onCaptureModeChange: (value: boolean) => void }) {
+  return (
+    <section className="tab-panel standings-panel">
+      {captureMode ? (
+        <header className="standings-capture-header">
+          <div><Brand compact /><span>{snapshot.session.status === "ended" ? "FINAL STANDINGS" : "LIVE STANDINGS"}</span></div>
+          <h1>{snapshot.session.name}</h1>
+          <p>{snapshot.session.venue} · {formatDateTime(snapshot.session.scheduledStart, snapshot.session.timezone)} · {snapshot.players.filter((player) => player.active).length} players</p>
+          <button className="button ghost compact capture-exit" onClick={() => onCaptureModeChange(false)}><X size={15} /> Exit screenshot view</button>
+        </header>
+      ) : (
+        <div className="panel-heading standings-heading">
+          <div><p className="eyebrow">Leaderboard</p><h2>Standings</h2><p>A win earns 3 points. Ties are ordered by point difference, then total wins.</p></div>
+          <div className="standings-tools"><span className="rules-note"><Trophy size={15} /> WIN = 3 PTS</span><button className="button secondary compact" onClick={() => onCaptureModeChange(true)}><Camera size={16} /> Screenshot view</button></div>
+        </div>
+      )}
+      <div className="standings-table" aria-label="Player standings">
+        <div className="standings-head"><span>#</span><span>Player</span><span>GP</span><span>W–L</span><span>Win</span><span>PTS</span><span>+/−</span></div>
+        {snapshot.standings.map((standing, index) => (
+          <div className={`standings-row ${index < 3 ? `podium podium-${index + 1}` : ""}`} key={standing.playerId}>
+            <b className="rank">{index + 1}</b>
+            <span className="standing-player"><strong>{standing.name}</strong><small>{LEVEL_LABELS[standing.level]}</small></span>
+            <span>{standing.gamesPlayed}</span>
+            <span>{standing.wins}–{standing.losses}</span>
+            <span>{standing.winRate}%</span>
+            <b className="leader-points">{standing.leaderboardPoints}</b>
+            <span className={standing.pointDifference > 0 ? "positive" : standing.pointDifference < 0 ? "negative" : ""}>{standing.pointDifference > 0 ? "+" : ""}{standing.pointDifference}</span>
+          </div>
+        ))}
+      </div>
+      {captureMode ? <p className="capture-footnote">SportRound · Win = 3 pts · Ranked by points, point difference, then wins</p> : null}
+    </section>
+  );
 }
 
 function ScoreDialog({ match, players, saving, canCorrect, onClose, onSave }: { match: MatchRecord; players: PlayerRecord[]; saving: boolean; canCorrect: boolean; onClose: () => void; onSave: (winner: Team, loserScore: number) => void }) {
@@ -512,12 +762,70 @@ function ScoreDialog({ match, players, saving, canCorrect, onClose, onSave }: { 
   return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="score-dialog" role="dialog" aria-modal="true" aria-labelledby="score-title"><header><div><p className="eyebrow">{canCorrect && match.status === "completed" ? "CORRECT RESULT" : "SCORE EDITOR"}</p><h2 id="score-title">Court {match.courtNumber} final score</h2></div><button className="icon-button" onClick={onClose} aria-label="Close score editor"><X /></button></header><div className="score-help">Choose the winner, then adjust the losing score. The result stays private until Save Score.</div><div className="score-teams">{(["a", "b"] as Team[]).map((team) => <div className={`score-team ${winner === team ? "selected-winner" : ""} ${winner && winner !== team ? "selected-loser" : ""}`} key={team}><div className="score-team-head"><div><span>TEAM {team.toUpperCase()}</span><strong>{names(team)}</strong></div>{winner === team ? <span className="winner-badge"><Trophy size={12} /> WINNER</span> : null}</div><div className="score-controls"><button aria-label={`Subtract from Team ${team.toUpperCase()}`} onClick={() => adjust(team, -1)} disabled={!winner || winner === team || scores[team] <= 0}><Minus /></button><output aria-live="polite">{String(scores[team]).padStart(2, "0")}</output><button aria-label={`Add to Team ${team.toUpperCase()}`} onClick={() => adjust(team, 1)} disabled={!winner || winner === team || scores[team] >= 20}><Plus /></button></div><button className={`mark-winner ${winner === team ? "active" : ""}`} onClick={() => markWinner(team)}>{winner === team ? <><Check size={17} /> Marked as winner · 21</> : "Mark as winner · 21"}</button></div>)}</div><footer><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={!winner || saving} onClick={() => winner && onSave(winner, scores[losingTeam])}>{saving ? "Saving…" : "Save Score"}</button></footer></section></div>;
 }
 
-function SubstitutionDialog({ match, snapshot, saving, onClose, onSave }: { match: MatchRecord; snapshot: SessionSnapshot; saving: boolean; onClose: () => void; onSave: (outgoingAssignmentId: number, replacementPlayerId: string) => Promise<void> }) {
+function ReplacementDialog({
+  match,
+  snapshot,
+  kind,
+  initialOutgoingAssignmentId,
+  saving,
+  onClose,
+  onSave,
+}: {
+  match: MatchRecord;
+  snapshot: SessionSnapshot;
+  kind: "live" | "planned";
+  initialOutgoingAssignmentId?: number;
+  saving: boolean;
+  onClose: () => void;
+  onSave: (outgoingAssignmentId: number, replacementPlayerId: string) => Promise<void>;
+}) {
   const activeAssignments = match.assignments.filter((assignment) => assignment.active);
-  const playingIds = new Set(snapshot.rounds.find((round) => round.status === "live")?.matches.flatMap((candidate) => candidate.assignments.filter((assignment) => assignment.active).map((assignment) => assignment.playerId)) ?? []);
-  const available = snapshot.players.filter((player) => player.active && !playingIds.has(player.id));
-  const [outgoing, setOutgoing] = useState(String(activeAssignments[0]?.id ?? ""));
-  const [replacement, setReplacement] = useState(available[0]?.id ?? "");
+  const round = snapshot.rounds.find((candidateRound) =>
+    candidateRound.matches.some((candidateMatch) => candidateMatch.id === match.id),
+  );
+  const [outgoing, setOutgoing] = useState(
+    String(initialOutgoingAssignmentId ?? activeAssignments[0]?.id ?? ""),
+  );
+  const [suggestion, setSuggestion] = useState<ReplacementCandidate | null>(null);
+  const [seenSuggestions, setSeenSuggestions] = useState<string[]>([]);
   const playerMap = new Map(snapshot.players.map((player) => [player.id, player]));
-  return <div className="modal-backdrop"><section className="small-dialog" role="dialog" aria-modal="true" aria-labelledby="replace-title"><header><div><p className="eyebrow">LIVE SUBSTITUTION</p><h2 id="replace-title">Replace a Court {match.courtNumber} player</h2></div><button className="icon-button" onClick={onClose} aria-label="Close"><X /></button></header><p>The original player remains in match history. The replacement takes the same team and slot.</p><label className="field"><span>Player leaving</span><select value={outgoing} onChange={(event) => setOutgoing(event.target.value)}>{activeAssignments.map((assignment) => <option value={assignment.id} key={assignment.id}>{playerMap.get(assignment.playerId)?.name} · Team {assignment.team.toUpperCase()}</option>)}</select></label><label className="field"><span>Replacement from waiting list</span><select value={replacement} onChange={(event) => setReplacement(event.target.value)}><option value="">Select waiting player</option>{available.map((player) => <option value={player.id} key={player.id}>{player.name} · {LEVEL_LABELS[player.level]} · {snapshot.standings.find((standing) => standing.playerId === player.id)?.gamesPlayed ?? 0} played</option>)}</select></label><footer><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={!outgoing || !replacement || saving} onClick={() => void onSave(Number(outgoing), replacement)}>{saving ? "Replacing…" : "Confirm replacement"}</button></footer></section></div>;
+  const rankedCandidates = round && outgoing
+    ? rankReplacementCandidates({
+        match,
+        round,
+        outgoingAssignmentId: Number(outgoing),
+        players: snapshot.players,
+        standings: snapshot.standings,
+      })
+    : [];
+  const candidatePool = fairReplacementPool(rankedCandidates);
+  const suggestedPlayer = suggestion ? playerMap.get(suggestion.playerId) : null;
+  const suggestedStanding = suggestion
+    ? snapshot.standings.find((standing) => standing.playerId === suggestion.playerId)
+    : null;
+
+  function changeOutgoing(value: string) {
+    setOutgoing(value);
+    setSuggestion(null);
+    setSeenSuggestions([]);
+  }
+
+  function shuffleSuggestion() {
+    if (candidatePool.length === 0) return;
+    const unseen = candidatePool.filter(
+      (candidate) => !seenSuggestions.includes(candidate.playerId),
+    );
+    const choices = unseen.length > 0 ? unseen : candidatePool;
+    const random = new Uint32Array(1);
+    window.crypto.getRandomValues(random);
+    const selected = choices[random[0] % choices.length];
+    setSuggestion(selected);
+    setSeenSuggestions(
+      unseen.length > 0
+        ? [...seenSuggestions, selected.playerId]
+        : [selected.playerId],
+    );
+  }
+
+  return <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section className="small-dialog replacement-dialog" role="dialog" aria-modal="true" aria-labelledby="replace-title"><header><div><p className="eyebrow">{kind === "live" ? "LIVE REPLACEMENT" : "LINEUP REPLACEMENT"}</p><h2 id="replace-title">Replace a Court {match.courtNumber} player</h2></div><button className="icon-button" onClick={onClose} aria-label="Close replacement dialog"><X /></button></header><p>Choose who is leaving, then let SportRound suggest a fair waiting player based on court balance, level, rest, and games played.</p><label className="field"><span>Player leaving</span><select value={outgoing} onChange={(event) => changeOutgoing(event.target.value)}>{activeAssignments.map((assignment) => <option value={assignment.id} key={assignment.id}>{playerMap.get(assignment.playerId)?.name} · Team {assignment.team.toUpperCase()}</option>)}</select></label><section className={`replacement-suggestion ${suggestedPlayer ? "has-suggestion" : ""}`} aria-live="polite"><div><p className="eyebrow">SYSTEM SUGGESTION</p>{suggestedPlayer && suggestion ? <><h3>{suggestedPlayer.name}</h3><span>{LEVEL_LABELS[suggestedPlayer.level]} · {suggestedStanding?.gamesPlayed ?? 0} played</span><small>{suggestion.balanceGap === 0 ? "Keeps both teams level-balanced." : `Closest fair option · ${suggestion.balanceGap} level-point court gap.`}{suggestion.consecutiveRoundPenalty ? " Recently played, but still among the fairest available choices." : " Prioritizes a rested waiting player."}</small></> : <><h3>Ready to find a fair replacement</h3><span>{candidatePool.length ? `${candidatePool.length} best-balanced option${candidatePool.length === 1 ? "" : "s"} available` : "No waiting player is currently available"}</span><small>Shuffle only chooses from the system&apos;s best-balanced candidate pool.</small></>}</div><button className="button secondary" type="button" onClick={shuffleSuggestion} disabled={!outgoing || candidatePool.length === 0 || saving}><RefreshCw size={16} /> {suggestedPlayer ? "Shuffle again" : "Shuffle player"}</button></section><footer><button className="button secondary" onClick={onClose}>Cancel</button><button className="button primary" disabled={!outgoing || !suggestedPlayer || saving} onClick={() => suggestedPlayer && void onSave(Number(outgoing), suggestedPlayer.id)}>{saving ? "Replacing…" : "Confirm replacement"}</button></footer></section></div>;
 }

@@ -1,6 +1,6 @@
 # SportRound
 
-SportRound is a responsive badminton session manager for browsers. A host creates the session, reviews balanced lineups, starts rounds, replaces players, and ends the session. Anyone with the shared link can follow every court and submit a live final score.
+SportRound is a responsive badminton session manager for browsers. A host creates the session, reviews balanced lineups, starts rounds, replaces players, records scores, and ends the session. Anyone with the shared link can follow the active session in a strictly view-only mode.
 
 The MVP is deliberately runnable without a paid service. It starts with an in-memory backend for local demos and E2E tests, and includes a complete Supabase schema for persistent multi-user use.
 
@@ -14,15 +14,17 @@ The MVP is deliberately runnable without a paid service. It starts with an in-me
 - Fair rotation based on games played and rest
 - Reduced repeated partners and opponents
 - Lineup review, waiting list, and games-played counters
-- Host-only lineup replacement and live substitution
+- Host-only lineup replacement and live substitution with fair, repeatable shuffle suggestions
 - Live court cards shaped like badminton courts
 - One-click winner at 21; losing score is adjustable from 0–20
 - Score is published only after **Save Score**
 - Winner badge on live and completed court cards
 - Direct **Start next game** or **Review lineup** flow
-- Shared viewer page with Supabase Realtime updates and a 30-second fallback refresh
+- Prepare, review, replace, or regenerate one upcoming round while the current round is still live; starting remains locked until every active court finishes
+- View-only shared page with Supabase Realtime updates and a 30-second fallback refresh
+- Shared access closes when the host ends the session or its scheduled duration expires
 - Round directory with Next and Completed history
-- Leaderboard with rank, games, W–L, points, win rate, and point difference
+- Compact, screenshot-friendly leaderboard with rank, games, W–L, points, win rate, and point difference
 - Host ownership through an HttpOnly token cookie
 
 ## Cost and backend modes
@@ -91,7 +93,7 @@ It creates normalized tables for sessions, players, rounds, matches, assignments
 
 Browser clients never receive the service-role key. Realtime clients use only the browser-safe publishable key and receive an invalidation event without session data; the latest snapshot still comes through validated Next.js route handlers. The host token is generated with 32 random bytes, stored only as a SHA-256 hash in the database, and returned to the host as an HttpOnly, SameSite cookie.
 
-Anyone holding a share link can view the session and submit a score for a live match, as requested for this MVP. They cannot generate rounds, change lineups, substitute players, or end the session.
+Anyone holding a share link can view an active session, but cannot submit scores or perform any other mutation. The public route exposes only a read endpoint. The shared view stops returning session data as soon as the host ends the session or the scheduled start plus duration is reached. Expiry does not lock the host workspace, so the host can still review it and explicitly end the session.
 
 ## Rotation rules
 
@@ -105,7 +107,7 @@ For every generated round, SportRound:
 6. Penalizes repeated partnerships and repeated opponents.
 7. Uses a session-and-round seed so the same state produces a stable lineup.
 
-Session duration is recorded and displayed, but it does not guess a fixed match duration. The host decides when to move to the next round while the scheduler keeps participation balanced.
+Session duration defines the lifetime of the shared view, but it does not guess a fixed match duration. The host decides when to move to the next round while the scheduler keeps participation balanced.
 
 ## Score and leaderboard rules
 
@@ -151,5 +153,5 @@ tests/e2e/               Desktop/mobile host and viewer flow
 - Badminton only; the domain types leave room for additional sports later.
 - Host access is device/browser-cookie based; account login and host transfer are not included.
 - Shared live refresh uses Supabase Realtime Broadcast over WebSocket with focus/online refresh and a 30-second polling fallback.
-- The public score endpoint has schema and live-match validation but no distributed rate limiter yet.
+- Shared access is possession-based: anyone with an unexpired link can read that session, but shared routes cannot mutate it.
 - No payment, booking, notification, or tournament-bracket feature is included.

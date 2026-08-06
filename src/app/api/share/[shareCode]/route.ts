@@ -7,7 +7,10 @@ export async function GET(
 ) {
   try {
     const { shareCode } = await params;
-    return Response.json({ data: await getSharedSession(shareCode) });
+    return Response.json(
+      { data: await getSharedSession(shareCode) },
+      { headers: { "cache-control": "private, no-store" } },
+    );
   } catch (error) {
     return jsonError(error);
   }

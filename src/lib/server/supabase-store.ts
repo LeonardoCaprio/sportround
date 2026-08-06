@@ -267,6 +267,20 @@ export class SupabaseSportRoundStore implements SportRoundStore {
     return this.requireSession(sessionId);
   }
 
+  async deletePlannedRound(sessionId: string, roundId: string): Promise<SessionAggregate> {
+    const { data, error } = await this.client
+      .from("rounds")
+      .delete()
+      .eq("id", roundId)
+      .eq("session_id", sessionId)
+      .eq("status", "planned")
+      .select("id")
+      .maybeSingle();
+    if (error) databaseError("Could not remove the planned lineup.", error);
+    if (!data) throw new ApiError(404, "Planned round not found.");
+    return this.requireSession(sessionId);
+  }
+
   async startRound(sessionId: string, roundId: string): Promise<SessionAggregate> {
     const timestamp = new Date().toISOString();
     const { data: round, error: roundError } = await this.client

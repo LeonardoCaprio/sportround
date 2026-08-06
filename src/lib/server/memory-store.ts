@@ -21,17 +21,17 @@ interface MemoryDatabase {
   substitutionSequence: number;
 }
 
-declare global {
-  var __sportRoundMemoryDatabase: MemoryDatabase | undefined;
-}
+const memoryProcess = process as typeof process & {
+  __sportRoundMemoryDatabase?: MemoryDatabase;
+};
 
-const database: MemoryDatabase = globalThis.__sportRoundMemoryDatabase ?? {
+const database: MemoryDatabase = memoryProcess.__sportRoundMemoryDatabase ?? {
   sessions: new Map(),
   assignmentSequence: 0,
   substitutionSequence: 0,
 };
 
-globalThis.__sportRoundMemoryDatabase = database;
+memoryProcess.__sportRoundMemoryDatabase = database;
 
 function now(): string {
   return new Date().toISOString();
@@ -112,8 +112,8 @@ export class MemorySportRoundStore implements SportRoundStore {
 
   async createRound(sessionId: string, plan: LineupPlan): Promise<SessionAggregate> {
     const aggregate = requireAggregate(sessionId);
-    if (aggregate.rounds.some((round) => round.status !== "completed")) {
-      throw new ApiError(409, "Finish the current round before generating another one.");
+    if (aggregate.rounds.some((round) => round.status === "planned")) {
+      throw new ApiError(409, "A next-round lineup has already been prepared.");
     }
     const timestamp = now();
     const roundId = randomUUID();
@@ -165,6 +165,17 @@ export class MemorySportRoundStore implements SportRoundStore {
     };
     aggregate.rounds.push(round);
     aggregate.session.updatedAt = timestamp;
+    return copy(aggregate);
+  }
+
+  async deletePlannedRound(sessionId: string, roundId: string): Promise<SessionAggregate> {
+    const aggregate = requireAggregate(sessionId);
+    const index = aggregate.rounds.findIndex(
+      (round) => round.id === roundId && round.status === "planned",
+    );
+    if (index < 0) throw new ApiError(404, "Planned round not found.");
+    aggregate.rounds.splice(index, 1);
+    aggregate.session.updatedAt = now();
     return copy(aggregate);
   }
 

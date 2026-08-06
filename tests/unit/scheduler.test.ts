@@ -32,6 +32,27 @@ describe("lineup scheduler", () => {
     }
   });
 
+  it("treats players on a live court as having a projected game for the next lineup", () => {
+    const players = Array.from({ length: 8 }, (_, index) => player(`player-${index + 1}`));
+    const liveRound = completedRound(
+      1,
+      ["player-1", "player-2"],
+      ["player-3", "player-4"],
+    );
+    liveRound.status = "live";
+    liveRound.completedAt = null;
+    liveRound.matches[0].status = "live";
+    liveRound.matches[0].completedAt = null;
+    liveRound.matches[0].winner = null;
+    liveRound.matches[0].teamAScore = 0;
+    liveRound.matches[0].teamBScore = 0;
+
+    const lineup = generateLineup(players, [liveRound], 1, "doubles", "projected-live-game");
+    const assigned = new Set(lineup.matches.flatMap((match) => [...match.teamA, ...match.teamB]));
+
+    expect(assigned).toEqual(new Set(["player-5", "player-6", "player-7", "player-8"]));
+  });
+
   it("creates level-balanced doubles teams and is deterministic", () => {
     const players = [
       player("pro-1", "pro"),
